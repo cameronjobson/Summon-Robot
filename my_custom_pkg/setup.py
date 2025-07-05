@@ -20,6 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'play_boxing = my_custom_pkg.play_boxing:main'
         ],
     },
 )
