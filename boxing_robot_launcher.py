@@ -9,6 +9,9 @@ import subprocess
 import time
 import sys
 import os
+import cv2
+import mediapipe as mp
+import argparse
 
 def check_puppy_control_running():
     """Check if puppy_control node is already running"""
@@ -60,7 +63,49 @@ def run_boxing_script():
         print(f"Error running boxing script: {e}")
         return False
 
+def run_boxing_on_hand_detect():
+    print("Starting camera for hand detection...")
+    mp_hands = mp.solutions.hands
+    hands = mp_hands.Hands(static_image_mode=False,
+                           max_num_hands=1,
+                           min_detection_confidence=0.7,
+                           min_tracking_confidence=0.7)
+    cap = cv2.VideoCapture(0)
+    hand_detected = False
+    boxing_triggered = False
+    print("Press 'q' to quit.")
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(image)
+        if results.multi_hand_landmarks:
+            if not boxing_triggered:
+                print("Hand detected! Triggering boxing motion...")
+                run_boxing_script()
+                boxing_triggered = True
+        else:
+            boxing_triggered = False  # Reset trigger if hand is not detected
+        # Draw hand landmarks if present
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                mp.solutions.drawing_utils.draw_landmarks(
+                    frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        cv2.imshow('Hand Detection', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    cap.release()
+    cv2.destroyAllWindows()
+
 def main():
+    parser = argparse.ArgumentParser(description="Boxing Robot Launcher")
+    parser.add_argument('--hand-detect', action='store_true', help='Trigger boxing action on hand detection via camera')
+    args = parser.parse_args()
+    if args.hand_detect:
+        run_boxing_on_hand_detect()
+        return 0
     print("=== Boxing Robot Launcher ===")
     
     # Check if puppy_control is already running
