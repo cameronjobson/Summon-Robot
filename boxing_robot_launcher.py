@@ -63,16 +63,42 @@ def run_boxing_script():
         print(f"Error running boxing script: {e}")
         return False
 
+def detect_middle_finger_gesture(hand_landmarks):
+    """
+    Detect if the hand is showing a middle finger gesture.
+    Middle finger extended, other fingers closed.
+    """
+    # Get the y-coordinates of the fingertips and middle joints
+    # Landmark indices for each finger tip and middle joint
+    finger_tips = [4, 8, 12, 16, 20]  # thumb, index, middle, ring, pinky
+    finger_mids = [3, 6, 10, 14, 18]  # thumb, index, middle, ring, pinky
+    
+    # Check if middle finger (index 12) is extended while others are closed
+    middle_finger_extended = hand_landmarks.landmark[12].y < hand_landmarks.landmark[10].y
+    index_finger_closed = hand_landmarks.landmark[8].y > hand_landmarks.landmark[6].y
+    ring_finger_closed = hand_landmarks.landmark[16].y > hand_landmarks.landmark[14].y
+    pinky_closed = hand_landmarks.landmark[20].y > hand_landmarks.landmark[18].y
+    
+    # Thumb is more flexible, so we check if it's roughly closed
+    thumb_closed = hand_landmarks.landmark[4].x < hand_landmarks.landmark[3].x
+    
+    return (middle_finger_extended and 
+            index_finger_closed and 
+            ring_finger_closed and 
+            pinky_closed and 
+            thumb_closed)
+
 def run_boxing_on_hand_detect():
-    print("Starting camera for hand detection...")
+    print("Starting camera for middle finger gesture detection...")
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(static_image_mode=False,
                            max_num_hands=1,
                            min_detection_confidence=0.7,
                            min_tracking_confidence=0.7)
     cap = cv2.VideoCapture(0)
-    hand_detected = False
+    gesture_detected = False
     boxing_triggered = False
+    print("Show middle finger gesture to trigger boxing motion!")
     print("Press 'q' to quit.")
     while cap.isOpened():
         ret, frame = cap.read()
@@ -82,18 +108,29 @@ def run_boxing_on_hand_detect():
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(image)
         if results.multi_hand_landmarks:
-            if not boxing_triggered:
-                print("Hand detected! Triggering boxing motion...")
-                run_boxing_script()
-                boxing_triggered = True
-        else:
-            boxing_triggered = False  # Reset trigger if hand is not detected
-        # Draw hand landmarks if present
-        if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
+                # Draw hand landmarks
                 mp.solutions.drawing_utils.draw_landmarks(
                     frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-        cv2.imshow('Hand Detection', frame)
+                
+                # Check for middle finger gesture
+                if detect_middle_finger_gesture(hand_landmarks):
+                    if not boxing_triggered:
+                        print("Middle finger gesture detected! Triggering boxing motion...")
+                        run_boxing_script()
+                        boxing_triggered = True
+                    # Draw a circle around the middle finger tip
+                    h, w, _ = frame.shape
+                    middle_tip = hand_landmarks.landmark[12]
+                    cx, cy = int(middle_tip.x * w), int(middle_tip.y * h)
+                    cv2.circle(frame, (cx, cy), 10, (0, 255, 0), -1)
+                    cv2.putText(frame, "MIDDLE FINGER DETECTED!", (10, 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                else:
+                    boxing_triggered = False  # Reset trigger if gesture is not detected
+        else:
+            boxing_triggered = False  # Reset trigger if no hand is detected
+        cv2.imshow('Middle Finger Gesture Detection', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
     cap.release()
