@@ -140,9 +140,6 @@ def main():
     parser = argparse.ArgumentParser(description="Boxing Robot Launcher")
     parser.add_argument('--hand-detect', action='store_true', help='Trigger boxing action on hand detection via camera')
     args = parser.parse_args()
-    if args.hand_detect:
-        run_boxing_on_hand_detect()
-        return 0
     print("=== Boxing Robot Launcher ===")
     
     # Check if puppy_control is already running
@@ -161,6 +158,10 @@ def main():
         # Wait a bit for services to be available
         print("Waiting for services to be ready...")
         time.sleep(2)
+
+        if args.hand_detect:
+            run_boxing_on_hand_detect()
+            return 0
         
         # Run the boxing script
         success = run_boxing_script()
