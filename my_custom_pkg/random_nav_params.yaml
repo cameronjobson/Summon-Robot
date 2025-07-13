@@ -1,0 +1,21 @@
+random_navigator:
+  ros__parameters:
+    # calibrated map‐frame corner coordinates
+    top_left:    [ -0.3380,  0.1390 ]
+    top_right:   [  0.6725,  0.4235 ]
+    bottom_right:[  0.9865, -0.5535 ]
+    bottom_left: [ -0.5800, -0.5220 ]
+
+    # where to place the robot at startup (must match one of the above)
+    start_corner: "top_left"
+    start_yaw:    0.0        # radians, 0 = facing +x in the map frame
+
+    # how long to wait after setInitialPose() for AMCL to converge
+    amcl_wait_time: 2.0      # seconds
+
+    # random‐goal loop settings
+    num_random_goals: 10     # total goals to send (omit or set to 0 for infinite)
+
+    # speed limits for navigation (m/s and m/s²)
+    max_speed: 0.3
+    max_accel: 0.2
