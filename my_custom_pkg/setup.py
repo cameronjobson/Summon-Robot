@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'boxing_robot = my_custom_pkg.boxing_robot:main',
+            'random_navigator = my_custom_pkg.random_navigator:main',
         ],
     },
 )
