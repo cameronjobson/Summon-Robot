@@ -67,6 +67,7 @@ class RandomNavigator(Node):
 
         # Set up Nav2 Simple Commander
         self.navigator = BasicNavigator()
+        print('Available BasicNavigator methods:', dir(self.navigator))
         self.get_logger().info('Waiting for Nav2 to become active...')
         self.navigator.waitUntilNav2Active()
         self.get_logger().info('Nav2 is active.')
@@ -118,11 +119,11 @@ class RandomNavigator(Node):
             )
             try:
                 self.navigator.goToPose(pose)
-                result = self.navigator.waitForNav2GoalToComplete()
-                if result == TaskResult.SUCCEEDED:
+                result = self.navigator.waitUntilNavArrived()
+                if result:
                     self.get_logger().info(f"Reached {goal} successfully.")
                 else:
-                    self.get_logger().warn(f"Failed to reach {goal}. Result: {result}")
+                    self.get_logger().warn(f"Failed to reach {goal}.")
             except Exception as e:
                 self.get_logger().error(
                     f"Exception during navigation: {e}\n{traceback.format_exc()}"
@@ -164,13 +165,11 @@ class RandomNavigator(Node):
                 )
                 try:
                     self.navigator.goToPose(pose)
-                    result = self.navigator.waitForNav2GoalToComplete()
-                    if result == TaskResult.SUCCEEDED:
+                    result = self.navigator.waitUntilNavArrived()
+                    if result:
                         self.get_logger().info(f"Random goal {count+1} reached successfully.")
                     else:
-                        self.get_logger().warn(
-                            f"Random goal {count+1} failed. Result: {result}"
-                        )
+                        self.get_logger().warn(f"Random goal {count+1} failed.")
                 except Exception as e:
                     self.get_logger().error(
                         f"Exception during random navigation: {e}\n{traceback.format_exc()}"
