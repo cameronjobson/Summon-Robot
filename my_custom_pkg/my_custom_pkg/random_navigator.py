@@ -119,11 +119,13 @@ class RandomNavigator(Node):
             )
             try:
                 self.navigator.goToPose(pose)
-                result = self.navigator.waitUntilNavArrived()
-                if result:
+                while not self.navigator.isTaskComplete():
+                    rclpy.spin_once(self, timeout_sec=1.0)
+                result = self.navigator.getResult()
+                if result == TaskResult.SUCCEEDED:
                     self.get_logger().info(f"Reached {goal} successfully.")
                 else:
-                    self.get_logger().warn(f"Failed to reach {goal}.")
+                    self.get_logger().warn(f"Failed to reach {goal}. Result: {result}")
             except Exception as e:
                 self.get_logger().error(
                     f"Exception during navigation: {e}\n{traceback.format_exc()}"
@@ -165,11 +167,13 @@ class RandomNavigator(Node):
                 )
                 try:
                     self.navigator.goToPose(pose)
-                    result = self.navigator.waitUntilNavArrived()
-                    if result:
+                    while not self.navigator.isTaskComplete():
+                        rclpy.spin_once(self, timeout_sec=1.0)
+                    result = self.navigator.getResult()
+                    if result == TaskResult.SUCCEEDED:
                         self.get_logger().info(f"Random goal {count+1} reached successfully.")
                     else:
-                        self.get_logger().warn(f"Random goal {count+1} failed.")
+                        self.get_logger().warn(f"Random goal {count+1} failed. Result: {result}")
                 except Exception as e:
                     self.get_logger().error(
                         f"Exception during random navigation: {e}\n{traceback.format_exc()}"
