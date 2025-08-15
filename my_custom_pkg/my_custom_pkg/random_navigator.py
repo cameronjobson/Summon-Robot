@@ -8,6 +8,13 @@ import random
 import sys
 import traceback
 from typing import List, Tuple
+import os
+import time
+import subprocess
+
+# --- Optional CV imports (only needed for palm check) ---
+import cv2
+import mediapipe as mp
 
 # --- Math & quaternion helpers ---
 def quaternion_from_euler(roll: float, pitch: float, yaw: float):
@@ -100,6 +107,79 @@ def point_outside_convex_quad(x: float, y: float, verts_ccw: List[Tuple[float, f
             return True
     return False
 
+# --- CV: palm (open hand) detector ---
+class PalmDetector:
+    """
+    Simple palm-facing-camera heuristic using MediaPipe Hands.
+    - Fingers (index..pinky) extended: tip.y < pip.y
+    - Thumb reasonably extended from palm (tip farther from wrist than IP)
+    - Palm "toward camera" approximation: average of finger DIP->TIP z deltas negative (tips closer).
+      (MediaPipe z is roughly depth; more negative ~= closer to camera.)
+    """
+    def __init__(self, camera_index: int = 0):
+        self.camera_index = camera_index
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6
+        )
+
+    def _is_palm_facing(self, lm) -> bool:
+        # Indices
+        # Thumb: 2 MCP, 3 IP, 4 TIP
+        # Fingers: (index) 6 PIP, 8 TIP; (middle) 10,12; (ring) 14,16; (pinky) 18,20
+        def extended(tip, pip):  # smaller y = higher in image
+            return lm[tip].y < lm[pip].y
+
+        idx_ext = extended(8, 6)
+        mid_ext = extended(12, 10)
+        rng_ext = extended(16, 14)
+        pky_ext = extended(20, 18)
+        fingers_extended = idx_ext and mid_ext and rng_ext and pky_ext
+
+        # Thumb: TIP further from wrist (0) than IP to avoid fist
+        wrist = lm[0]
+        thumb_farther = (abs(lm[4].x - wrist.x) + abs(lm[4].y - wrist.y)) > (abs(lm[3].x - wrist.x) + abs(lm[3].y - wrist.y))
+
+        # Palm facing camera: average (tip.z - dip.z) < 0 across extended fingers
+        # Use PIP/DIP proxies since DIP not used above
+        # DIP indices: index 7, middle 11, ring 15, pinky 19
+        depth_diffs = [
+            lm[8].z - lm[7].z,
+            lm[12].z - lm[11].z,
+            lm[16].z - lm[15].z,
+            lm[20].z - lm[19].z
+        ]
+        palm_toward = sum(depth_diffs) / len(depth_diffs) < 0.0
+
+        return fingers_extended and thumb_farther and palm_toward
+
+    def wait_for_palm(self, timeout_sec: float = 20.0) -> bool:
+        # Prefer V4L2 on RPi
+        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            return False
+
+        start = time.time()
+        try:
+            while (time.time() - start) < timeout_sec:
+                ok, frame = cap.read()
+                if not ok:
+                    time.sleep(0.02)
+                    continue
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                res = self.hands.process(rgb)
+                if res.multi_hand_landmarks:
+                    for hand in res.multi_hand_landmarks:
+                        if self._is_palm_facing(hand.landmark):
+                            return True
+        finally:
+            cap.release()
+        return False
+
+
 class RandomNavigator(Node):
     def __init__(self):
         super().__init__('random_navigator')
@@ -129,6 +209,10 @@ class RandomNavigator(Node):
         self.declare_parameter('nudge_corners', False)
         self.declare_parameter('safety_margin', 0.10)          # used only if above toggles are True
 
+        # CV parameters
+        self.declare_parameter('camera_index', 0)
+        self.declare_parameter('palm_timeout_sec', 20.0)
+
         # Read parameters
         self.corners = {
             'top_left': self.get_parameter('top_left').get_parameter_value().double_array_value,
@@ -154,6 +238,9 @@ class RandomNavigator(Node):
         self.nudge_corners = self.get_parameter('nudge_corners').get_parameter_value().bool_value
         self.safety_margin = self.get_parameter('safety_margin').get_parameter_value().double_value
 
+        self.camera_index = self.get_parameter('camera_index').get_parameter_value().integer_value
+        self.palm_timeout_sec = self.get_parameter('palm_timeout_sec').get_parameter_value().double_value
+
         # Validate corners
         for name in ['top_left', 'top_right', 'bottom_right', 'bottom_left']:
             if len(self.corners[name]) != 2:
@@ -173,7 +260,6 @@ class RandomNavigator(Node):
 
         # Set up Nav2 Simple Commander
         self.navigator = BasicNavigator()
-        print('Available BasicNavigator methods:', dir(self.navigator))
         self.get_logger().info('Waiting for Nav2 to become active...')
         self.navigator.waitUntilNav2Active()
         self.get_logger().info('Nav2 is active.')
@@ -189,13 +275,16 @@ class RandomNavigator(Node):
         self.set_initial_pose()
         rclpy.spin_once(self, timeout_sec=0.1)
         self.get_logger().info(f"Waiting {self.amcl_wait_time} seconds for AMCL convergence...")
-        import time; time.sleep(self.amcl_wait_time)
+        time.sleep(self.amcl_wait_time)
 
         # Calibration lap (no OOB, no corner nudging)
         self.calibration_lap()
 
         # Go to center; once reached, enable OOB logic
         self.go_to_center_and_enable_oob()
+
+        # Prepare palm detector (used only for random goals)
+        self.palm_detector = PalmDetector(camera_index=self.camera_index)
 
         # Random goal loop (OOB logic is now active)
         self.random_goal_loop()
@@ -341,6 +430,30 @@ class RandomNavigator(Node):
                     f"Exception during navigation: {e}\n{traceback.format_exc()}"
                 )
 
+    # --- Run the sit→thumbs-up→stand script if palm detected (random goals only) ---
+    def maybe_run_sit_stand_on_palm(self):
+        self.get_logger().info(f"Scanning for open palm for up to {self.palm_timeout_sec:.0f}s...")
+        found = False
+        try:
+            found = self.palm_detector.wait_for_palm(timeout_sec=self.palm_timeout_sec)
+        except Exception as e:
+            self.get_logger().warn(f"Palm detection error (continuing anyway): {e}")
+
+        if found:
+            self.get_logger().info("Palm detected. Running sit_then_stand_on_thumbs_up.py ...")
+            try:
+                script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           'sit_then_stand_on_thumbs_up.py')
+                # Prefer calling with the current Python to avoid exec perms/env issues
+                subprocess.run([sys.executable, script_path, '--no-window'], timeout=90)
+                self.get_logger().info("sit_then_stand_on_thumbs_up.py completed.")
+            except subprocess.TimeoutExpired:
+                self.get_logger().warn("sit_then_stand_on_thumbs_up.py timed out; continuing.")
+            except Exception as e:
+                self.get_logger().warn(f"Failed to run sit_then_stand_on_thumbs_up.py: {e}")
+        else:
+            self.get_logger().info("No palm detected; continuing navigation.")
+
     def random_goal_loop(self):
         self.get_logger().info('Starting random goal loop...')
         corners = self.corners
@@ -391,6 +504,8 @@ class RandomNavigator(Node):
                     result = self.navigator.getResult()
                     if result == TaskResult.SUCCEEDED:
                         self.get_logger().info(f"Random goal {count+1} reached successfully.")
+                        # === ONLY here: after a random-goal success ===
+                        self.maybe_run_sit_stand_on_palm()
                     else:
                         self.get_logger().warn(f"Random goal {count+1} failed. Result: {result}")
                 except Exception as e:
