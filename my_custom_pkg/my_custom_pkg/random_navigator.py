@@ -8,7 +8,7 @@ import random
 import sys
 import traceback
 
-# Custom implementation to avoid external tf transformations dependency
+# --- Math & quaternion helpers ---
 def quaternion_from_euler(roll: float, pitch: float, yaw: float):
     """
     Convert Euler angles (roll, pitch, yaw) to quaternion (x, y, z, w).
@@ -31,8 +31,23 @@ def quaternion_from_euler(roll: float, pitch: float, yaw: float):
     return [x, y, z, w]
 
 def yaw_towards(from_x: float, from_y: float, to_x: float, to_y: float) -> float:
-    """Heading (yaw) that points from (from_x, from_y) directly toward (to_x, to_y)."""
+    """Heading (yaw) from (from_x, from_y) toward (to_x, to_y)."""
     return math.atan2(to_y - from_y, to_x - from_x)
+
+def normalize_angle(theta: float) -> float:
+    """Wrap angle to [-pi, pi]."""
+    while theta > math.pi:
+        theta -= 2.0 * math.pi
+    while theta < -math.pi:
+        theta += 2.0 * math.pi
+    return theta
+
+def yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
+    """Extract yaw from quaternion (robust general formula)."""
+    # Source: standard yaw extraction for ZYX
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 class RandomNavigator(Node):
     def __init__(self):
@@ -48,6 +63,10 @@ class RandomNavigator(Node):
         self.declare_parameter('num_random_goals', 10)
         self.declare_parameter('max_speed', 0.3)
         self.declare_parameter('max_accel', 0.2)
+        # Smart-yaw feature toggles/thresholds
+        self.declare_parameter('use_goal_heading', True)
+        self.declare_parameter('close_goal_distance', 0.35)   # m
+        self.declare_parameter('lookahead_distance', 0.40)     # m
 
         # Read parameters
         self.corners = {
@@ -62,6 +81,9 @@ class RandomNavigator(Node):
         self.num_random_goals = self.get_parameter('num_random_goals').get_parameter_value().integer_value
         self.max_speed = self.get_parameter('max_speed').get_parameter_value().double_value
         self.max_accel = self.get_parameter('max_accel').get_parameter_value().double_value
+        self.use_goal_heading = self.get_parameter('use_goal_heading').get_parameter_value().bool_value
+        self.close_goal_distance = self.get_parameter('close_goal_distance').get_parameter_value().double_value
+        self.lookahead_distance = self.get_parameter('lookahead_distance').get_parameter_value().double_value
 
         # Validate corners
         for name in ['top_left', 'top_right', 'bottom_right', 'bottom_left']:
@@ -76,7 +98,14 @@ class RandomNavigator(Node):
         self.navigator.waitUntilNav2Active()
         self.get_logger().info('Nav2 is active.')
 
-        # Set initial pose (preserved)
+        # Try to apply speed limits (if supported by this version)
+        try:
+            self.navigator.setSpeedLimits(self.max_speed, self.max_accel, 0.0)
+            self.get_logger().info(f"Speed limits set: max_speed={self.max_speed}, max_accel={self.max_accel}")
+        except Exception as e:
+            self.get_logger().warn(f"setSpeedLimits not supported or failed: {e}")
+
+        # Set initial pose (preserved position/yaw; stamp at time=0 to use latest TF)
         self.set_initial_pose()
         rclpy.spin_once(self, timeout_sec=0.1)
         self.get_logger().info(f"Waiting {self.amcl_wait_time} seconds for AMCL convergence...")
@@ -90,6 +119,8 @@ class RandomNavigator(Node):
 
     def set_initial_pose(self):
         pose = self.corner_to_pose(self.start_corner, self.start_yaw)
+        # Let AMCL consume with latest TF to avoid future-time extrapolation warnings
+        pose.header.stamp = rclpy.time.Time().to_msg()  # time=0 special stamp
         self.navigator.setInitialPose(pose)
         self.get_logger().info(
             f"Initial pose set to {self.start_corner} at {pose.pose.position.x}, {pose.pose.position.y}, yaw={self.start_yaw}"
@@ -110,6 +141,45 @@ class RandomNavigator(Node):
         pose.pose.orientation.w = q[3]
         return pose
 
+    # --- Smart yaw selection helpers ---
+    def get_current_pose_xy_yaw(self):
+        """Return (x, y, yaw) from current pose; fallback to start corner/yaw."""
+        try:
+            p = self.navigator.getCurrentPose()
+            if p is not None:
+                x = p.pose.position.x
+                y = p.pose.position.y
+                qx = p.pose.orientation.x
+                qy = p.pose.orientation.y
+                qz = p.pose.orientation.z
+                qw = p.pose.orientation.w
+                yaw = yaw_from_quat(qx, qy, qz, qw)
+                return x, y, yaw
+        except Exception:
+            pass
+        sx, sy = self.corners[self.start_corner]
+        return sx, sy, self.start_yaw
+
+    def choose_goal_yaw(self, gx: float, gy: float) -> float:
+        """
+        Smart policy:
+          - If goal is close (<= close_goal_distance), keep current yaw to avoid double-rotate.
+          - Else, face a look-ahead point (goal projected ahead by lookahead_distance).
+        """
+        if not self.use_goal_heading:
+            return 0.0  # neutral; rely on tolerances
+
+        cx, cy, cyaw = self.get_current_pose_xy_yaw()
+        dx, dy = gx - cx, gy - cy
+        dist = math.hypot(dx, dy)
+
+        if dist <= max(self.close_goal_distance, 1e-3):
+            return normalize_angle(cyaw)
+
+        ux, uy = dx / dist, dy / dist
+        ax, ay = gx + self.lookahead_distance * ux, gy + self.lookahead_distance * uy
+        return normalize_angle(math.atan2(ay - cx, ax - cy))
+
     def calibration_lap(self):
         self.get_logger().info('Starting calibration lap...')
         order = ['top_left', 'top_right', 'bottom_right', 'bottom_left', 'top_left']
@@ -118,7 +188,13 @@ class RandomNavigator(Node):
             goal = order[i + 1]
             sx, sy = self.corners[start]
             gx, gy = self.corners[goal]
-            yaw = yaw_towards(sx, sy, gx, gy)
+
+            if self.use_goal_heading:
+                # For corners, distance is not "close"; use direct heading corner->corner
+                yaw = normalize_angle(yaw_towards(sx, sy, gx, gy))
+            else:
+                yaw = 0.0
+
             pose = self.corner_to_pose(goal, yaw)
             self.get_logger().info(
                 f"Navigating from {start} ({sx:.2f},{sy:.2f}) to {goal} ({gx:.2f},{gy:.2f}) with yaw={yaw:.2f}"
@@ -156,22 +232,8 @@ class RandomNavigator(Node):
                 x = A[0] + u * (B[0] - A[0]) + v * (C[0] - A[0])
                 y = A[1] + u * (B[1] - A[1]) + v * (C[1] - A[1])
 
-                # Get current pose to compute heading toward (x, y)
-                from_x = None
-                from_y = None
-                try:
-                    current_pose = self.navigator.getCurrentPose()
-                    if current_pose is not None:
-                        from_x = current_pose.pose.position.x
-                        from_y = current_pose.pose.position.y
-                except Exception:
-                    pass
-
-                # Fallback to start corner if current pose unavailable
-                if from_x is None or from_y is None:
-                    from_x, from_y = self.corners[self.start_corner]
-
-                yaw = yaw_towards(from_x, from_y, x, y)
+                # Choose yaw using smart policy
+                yaw = self.choose_goal_yaw(x, y)
 
                 # Build goal pose
                 pose = PoseStamped()
@@ -186,9 +248,10 @@ class RandomNavigator(Node):
                 pose.pose.orientation.z = q[2]
                 pose.pose.orientation.w = q[3]
 
+                cx, cy, _ = self.get_current_pose_xy_yaw()
                 self.get_logger().info(
                     f"Navigating to random goal {count+1}: "
-                    f"from approx ({from_x:.2f},{from_y:.2f}) to ({x:.2f},{y:.2f}) with yaw={yaw:.2f}"
+                    f"from approx ({cx:.2f},{cy:.2f}) to ({x:.2f},{y:.2f}) with yaw={yaw:.2f}"
                 )
                 try:
                     self.navigator.goToPose(pose)
