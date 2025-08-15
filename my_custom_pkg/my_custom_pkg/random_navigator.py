@@ -7,6 +7,7 @@ import math
 import random
 import sys
 import traceback
+from typing import List, Tuple, Optional
 
 # --- Math & quaternion helpers ---
 def quaternion_from_euler(roll: float, pitch: float, yaw: float):
@@ -44,10 +45,67 @@ def normalize_angle(theta: float) -> float:
 
 def yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
     """Extract yaw from quaternion (robust general formula)."""
-    # Source: standard yaw extraction for ZYX
     siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.atan2(siny_cosp, cosy_cosp)
+
+# --- Geofence helpers for a convex quad in CCW order ---
+def dot(ax: float, ay: float, bx: float, by: float) -> float:
+    return ax * bx + ay * by
+
+def norm(ax: float, ay: float) -> float:
+    return math.hypot(ax, ay)
+
+def push_inside_convex_quad(x: float, y: float, verts_ccw: List[Tuple[float, float]],
+                            margin: float = 0.15, iters: int = 3) -> Tuple[float, float]:
+    """
+    Ensure (x,y) lies at least `margin` inside a convex quad (verts CCW).
+    For each edge, if the point is closer than margin to the outside boundary,
+    push inward along the inward normal. Iterate a few times.
+    """
+    px, py = x, y
+    for _ in range(iters):
+        moved = False
+        for i in range(4):
+            x1, y1 = verts_ccw[i]
+            x2, y2 = verts_ccw[(i + 1) % 4]
+            ex, ey = (x2 - x1), (y2 - y1)
+            # inward normal for CCW polygon is the LEFT normal: (-ey, ex)
+            nx, ny = (-ey, ex)
+            nlen = norm(nx, ny)
+            if nlen == 0.0:
+                continue
+            nx, ny = nx / nlen, ny / nlen
+            # signed distance from point to edge along inward normal
+            d = dot(px - x1, py - y1, nx, ny)
+            if d < margin:
+                delta = (margin - d)
+                px += nx * delta
+                py += ny * delta
+                moved = True
+        if not moved:
+            break
+    return px, py
+
+def point_outside_convex_quad(x: float, y: float, verts_ccw: List[Tuple[float, float]],
+                              tol: float = 0.0) -> bool:
+    """
+    Return True if (x,y) is outside by more than -tol.
+    tol >= 0 allows a tiny bleed outside before triggering.
+    """
+    for i in range(4):
+        x1, y1 = verts_ccw[i]
+        x2, y2 = verts_ccw[(i + 1) % 4]
+        ex, ey = (x2 - x1), (y2 - y1)
+        nx, ny = (-ey, ex)  # inward normal
+        nlen = norm(nx, ny)
+        if nlen == 0.0:
+            continue
+        nx, ny = nx / nlen, ny / nlen
+        d = dot(x - x1, y - y1, nx, ny)
+        if d < -tol:
+            return True
+    return False
 
 class RandomNavigator(Node):
     def __init__(self):
@@ -67,6 +125,10 @@ class RandomNavigator(Node):
         self.declare_parameter('use_goal_heading', True)
         self.declare_parameter('close_goal_distance', 0.35)   # m
         self.declare_parameter('lookahead_distance', 0.40)     # m
+        # Geofence controls
+        self.declare_parameter('safety_margin', 0.15)          # m inside the fence
+        self.declare_parameter('oob_recovery_enabled', True)   # auto-correct if outside
+        self.declare_parameter('oob_check_period', 1.0)        # seconds between checks
 
         # Read parameters
         self.corners = {
@@ -84,12 +146,23 @@ class RandomNavigator(Node):
         self.use_goal_heading = self.get_parameter('use_goal_heading').get_parameter_value().bool_value
         self.close_goal_distance = self.get_parameter('close_goal_distance').get_parameter_value().double_value
         self.lookahead_distance = self.get_parameter('lookahead_distance').get_parameter_value().double_value
+        self.safety_margin = self.get_parameter('safety_margin').get_parameter_value().double_value
+        self.oob_recovery_enabled = self.get_parameter('oob_recovery_enabled').get_parameter_value().bool_value
+        self.oob_check_period = self.get_parameter('oob_check_period').get_parameter_value().double_value
 
         # Validate corners
         for name in ['top_left', 'top_right', 'bottom_right', 'bottom_left']:
             if len(self.corners[name]) != 2:
                 self.get_logger().error(f"Corner {name} must be a list of two floats [x, y].")
                 sys.exit(1)
+
+        # Define quad in CCW order (must match your actual geometry)
+        self.quad_ccw: List[Tuple[float, float]] = [
+            tuple(self.corners['top_left']),
+            tuple(self.corners['top_right']),
+            tuple(self.corners['bottom_right']),
+            tuple(self.corners['bottom_left']),
+        ]
 
         # Set up Nav2 Simple Commander
         self.navigator = BasicNavigator()
@@ -142,7 +215,7 @@ class RandomNavigator(Node):
         return pose
 
     # --- Smart yaw selection helpers ---
-    def get_current_pose_xy_yaw(self):
+    def get_current_pose_xy_yaw(self) -> Tuple[float, float, float]:
         """Return (x, y, yaw) from current pose; fallback to start corner/yaw."""
         try:
             p = self.navigator.getCurrentPose()
@@ -180,6 +253,40 @@ class RandomNavigator(Node):
         ax, ay = gx + self.lookahead_distance * ux, gy + self.lookahead_distance * uy
         return normalize_angle(math.atan2(ay - cx, ax - cy))
 
+    # --- OOB recovery check (called inside navigation loops) ---
+    def maybe_recover_if_oob(self, last_check_time: List[float]) -> None:
+        """
+        If robot is outside the quad, send a corrective pose to push it back inside.
+        last_check_time: a single-element list storing last check timestamp (mutable).
+        """
+        if not self.oob_recovery_enabled:
+            return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if last_check_time[0] is None or (now - last_check_time[0]) >= self.oob_check_period:
+            last_check_time[0] = now
+            cx, cy, _ = self.get_current_pose_xy_yaw()
+            if point_outside_convex_quad(cx, cy, self.quad_ccw, tol=0.02):
+                fix_x, fix_y = push_inside_convex_quad(cx, cy, self.quad_ccw, margin=self.safety_margin)
+                q = quaternion_from_euler(0.0, 0.0, 0.0)
+                fix = PoseStamped()
+                fix.header.frame_id = 'map'
+                fix.header.stamp = self.navigator.get_clock().now().to_msg()
+                fix.pose.position.x = fix_x
+                fix.pose.position.y = fix_y
+                fix.pose.position.z = 0.0
+                fix.pose.orientation.x, fix.pose.orientation.y, fix.pose.orientation.z, fix.pose.orientation.w = q
+                self.get_logger().warn(
+                    f"Out of bounds detected at ({cx:.2f},{cy:.2f}) — sending corrective pose to ({fix_x:.2f},{fix_y:.2f})."
+                )
+                # Send corrective goal and wait until complete before resuming
+                try:
+                    self.navigator.goToPose(fix)
+                    while not self.navigator.isTaskComplete():
+                        rclpy.spin_once(self, timeout_sec=0.5)
+                    _ = self.navigator.getResult()
+                except Exception as e:
+                    self.get_logger().error(f"OOB recovery exception: {e}\n{traceback.format_exc()}")
+
     def calibration_lap(self):
         self.get_logger().info('Starting calibration lap...')
         order = ['top_left', 'top_right', 'bottom_right', 'bottom_left', 'top_left']
@@ -189,20 +296,27 @@ class RandomNavigator(Node):
             sx, sy = self.corners[start]
             gx, gy = self.corners[goal]
 
+            # Nudge the corner goal inward by safety_margin to avoid edge fighting
+            gx_n, gy_n = push_inside_convex_quad(gx, gy, self.quad_ccw, margin=self.safety_margin)
+
             if self.use_goal_heading:
-                # For corners, distance is not "close"; use direct heading corner->corner
-                yaw = normalize_angle(yaw_towards(sx, sy, gx, gy))
+                yaw = normalize_angle(yaw_towards(sx, sy, gx_n, gy_n))
             else:
                 yaw = 0.0
 
             pose = self.corner_to_pose(goal, yaw)
+            pose.pose.position.x = gx_n
+            pose.pose.position.y = gy_n
+
             self.get_logger().info(
-                f"Navigating from {start} ({sx:.2f},{sy:.2f}) to {goal} ({gx:.2f},{gy:.2f}) with yaw={yaw:.2f}"
+                f"Navigating from {start} ({sx:.2f},{sy:.2f}) to {goal}*nudged ({gx_n:.2f},{gy_n:.2f}) with yaw={yaw:.2f}"
             )
             try:
                 self.navigator.goToPose(pose)
+                last_check_time = [None]
                 while not self.navigator.isTaskComplete():
                     rclpy.spin_once(self, timeout_sec=1.0)
+                    self.maybe_recover_if_oob(last_check_time)
                 result = self.navigator.getResult()
                 if result == TaskResult.SUCCEEDED:
                     self.get_logger().info(f"Reached {goal} successfully.")
@@ -232,7 +346,10 @@ class RandomNavigator(Node):
                 x = A[0] + u * (B[0] - A[0]) + v * (C[0] - A[0])
                 y = A[1] + u * (B[1] - A[1]) + v * (C[1] - A[1])
 
-                # Choose yaw using smart policy
+                # Hard-fence clamp: keep goal at least safety_margin inside
+                x, y = push_inside_convex_quad(x, y, self.quad_ccw, margin=self.safety_margin)
+
+                # Choose yaw using smart policy (uses current pose and clamped goal)
                 yaw = self.choose_goal_yaw(x, y)
 
                 # Build goal pose
@@ -255,8 +372,10 @@ class RandomNavigator(Node):
                 )
                 try:
                     self.navigator.goToPose(pose)
+                    last_check_time = [None]
                     while not self.navigator.isTaskComplete():
                         rclpy.spin_once(self, timeout_sec=1.0)
+                        self.maybe_recover_if_oob(last_check_time)
                     result = self.navigator.getResult()
                     if result == TaskResult.SUCCEEDED:
                         self.get_logger().info(f"Random goal {count+1} reached successfully.")
