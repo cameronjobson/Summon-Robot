@@ -3,8 +3,8 @@ random_navigator:
     # calibrated map‐frame corner coordinates
     top_left:    [ -0.328,  0.576 ]
     top_right:   [  1.07,  0.599 ]
-    bottom_right: [  0.977, -0.537 ]
-    bottom_left: [ -0.328, -0.411 ]
+    bottom_right: [  0.748, -0.581 ]
+    bottom_left: [ -0.813, -0.627 ]
 
     # where to place the robot at startup (must match one of the above)
     start_corner: "top_left"
