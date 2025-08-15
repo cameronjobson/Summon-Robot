@@ -30,6 +30,10 @@ def quaternion_from_euler(roll: float, pitch: float, yaw: float):
     w = cr * cp * cy + sr * sp * sy
     return [x, y, z, w]
 
+def yaw_towards(from_x: float, from_y: float, to_x: float, to_y: float) -> float:
+    """Heading (yaw) that points from (from_x, from_y) directly toward (to_x, to_y)."""
+    return math.atan2(to_y - from_y, to_x - from_x)
+
 class RandomNavigator(Node):
     def __init__(self):
         super().__init__('random_navigator')
@@ -72,11 +76,10 @@ class RandomNavigator(Node):
         self.navigator.waitUntilNav2Active()
         self.get_logger().info('Nav2 is active.')
 
-        # Set initial pose
+        # Set initial pose (preserved)
         self.set_initial_pose()
         rclpy.spin_once(self, timeout_sec=0.1)
         self.get_logger().info(f"Waiting {self.amcl_wait_time} seconds for AMCL convergence...")
-        # Use time.sleep if needed
         import time; time.sleep(self.amcl_wait_time)
 
         # Calibration lap
@@ -113,9 +116,12 @@ class RandomNavigator(Node):
         for i in range(len(order) - 1):
             start = order[i]
             goal = order[i + 1]
-            pose = self.corner_to_pose(goal, 0.0)
+            sx, sy = self.corners[start]
+            gx, gy = self.corners[goal]
+            yaw = yaw_towards(sx, sy, gx, gy)
+            pose = self.corner_to_pose(goal, yaw)
             self.get_logger().info(
-                f"Navigating from {start} to {goal} at {pose.pose.position.x}, {pose.pose.position.y}"
+                f"Navigating from {start} ({sx:.2f},{sy:.2f}) to {goal} ({gx:.2f},{gy:.2f}) with yaw={yaw:.2f}"
             )
             try:
                 self.navigator.goToPose(pose)
@@ -141,7 +147,7 @@ class RandomNavigator(Node):
         count = 0
         try:
             while self.num_random_goals <= 0 or count < self.num_random_goals:
-                # Pick triangle
+                # Pick triangle and sample a point uniformly
                 tri_idx = random.randint(0, 1)
                 A, B, C = triangles[tri_idx]
                 u, v = random.random(), random.random()
@@ -149,21 +155,40 @@ class RandomNavigator(Node):
                     u, v = 1 - u, 1 - v
                 x = A[0] + u * (B[0] - A[0]) + v * (C[0] - A[0])
                 y = A[1] + u * (B[1] - A[1]) + v * (C[1] - A[1])
+
+                # Get current pose to compute heading toward (x, y)
+                from_x = None
+                from_y = None
+                try:
+                    current_pose = self.navigator.getCurrentPose()
+                    if current_pose is not None:
+                        from_x = current_pose.pose.position.x
+                        from_y = current_pose.pose.position.y
+                except Exception:
+                    pass
+
+                # Fallback to start corner if current pose unavailable
+                if from_x is None or from_y is None:
+                    from_x, from_y = self.corners[self.start_corner]
+
+                yaw = yaw_towards(from_x, from_y, x, y)
+
+                # Build goal pose
                 pose = PoseStamped()
                 pose.header.frame_id = 'map'
                 pose.header.stamp = self.navigator.get_clock().now().to_msg()
                 pose.pose.position.x = x
                 pose.pose.position.y = y
                 pose.pose.position.z = 0.0
-                # Random yaw
-                yaw = random.uniform(-math.pi, math.pi)
                 q = quaternion_from_euler(0.0, 0.0, yaw)
                 pose.pose.orientation.x = q[0]
                 pose.pose.orientation.y = q[1]
                 pose.pose.orientation.z = q[2]
                 pose.pose.orientation.w = q[3]
+
                 self.get_logger().info(
-                    f"Navigating to random goal {count+1}: ({x:.2f}, {y:.2f}, yaw={yaw:.2f})"
+                    f"Navigating to random goal {count+1}: "
+                    f"from approx ({from_x:.2f},{from_y:.2f}) to ({x:.2f},{y:.2f}) with yaw={yaw:.2f}"
                 )
                 try:
                     self.navigator.goToPose(pose)
