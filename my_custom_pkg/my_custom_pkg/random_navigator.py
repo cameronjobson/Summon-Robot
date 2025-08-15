@@ -164,6 +164,9 @@ class RandomNavigator(Node):
             tuple(self.corners['bottom_left']),
         ]
 
+        # OOB logic starts disabled; enabled after center hop
+        self.oob_active: bool = False
+
         # Set up Nav2 Simple Commander
         self.navigator = BasicNavigator()
         print('Available BasicNavigator methods:', dir(self.navigator))
@@ -184,10 +187,13 @@ class RandomNavigator(Node):
         self.get_logger().info(f"Waiting {self.amcl_wait_time} seconds for AMCL convergence...")
         import time; time.sleep(self.amcl_wait_time)
 
-        # Calibration lap
+        # Calibration lap (no OOB checks during this phase)
         self.calibration_lap()
 
-        # Random goal loop
+        # Go to center; once reached, enable OOB logic
+        self.go_to_center_and_enable_oob()
+
+        # Random goal loop (OOB logic is now active)
         self.random_goal_loop()
 
     def set_initial_pose(self):
@@ -253,13 +259,54 @@ class RandomNavigator(Node):
         ax, ay = gx + self.lookahead_distance * ux, gy + self.lookahead_distance * uy
         return normalize_angle(math.atan2(ay - cx, ax - cy))
 
+    # --- Center utilities & transition to OOB active ---
+    def center_of_quad(self) -> Tuple[float, float]:
+        xs = [p[0] for p in self.quad_ccw]
+        ys = [p[1] for p in self.quad_ccw]
+        cx = sum(xs) / 4.0
+        cy = sum(ys) / 4.0
+        # Nudge to be at least safety_margin inside (handles skewed quads)
+        cx, cy = push_inside_convex_quad(cx, cy, self.quad_ccw, margin=self.safety_margin)
+        return cx, cy
+
+    def go_to_center_and_enable_oob(self):
+        cx, cy = self.center_of_quad()
+        yaw = self.choose_goal_yaw(cx, cy)
+        q = quaternion_from_euler(0.0, 0.0, yaw)
+        goal = PoseStamped()
+        goal.header.frame_id = 'map'
+        goal.header.stamp = self.navigator.get_clock().now().to_msg()
+        goal.pose.position.x = cx
+        goal.pose.position.y = cy
+        goal.pose.position.z = 0.0
+        goal.pose.orientation.x = q[0]
+        goal.pose.orientation.y = q[1]
+        goal.pose.orientation.z = q[2]
+        goal.pose.orientation.w = q[3]
+
+        self.get_logger().info(f"Calibration complete. Moving to center ({cx:.2f},{cy:.2f}) before enabling OOB.")
+        try:
+            self.navigator.goToPose(goal)
+            while not self.navigator.isTaskComplete():
+                rclpy.spin_once(self, timeout_sec=0.5)
+            result = self.navigator.getResult()
+            if result == TaskResult.SUCCEEDED:
+                self.get_logger().info("Reached center. Enabling out-of-bounds logic.")
+                self.oob_active = True
+            else:
+                self.get_logger().warn(f"Center move failed (result={result}). Enabling OOB anyway.")
+                self.oob_active = True
+        except Exception as e:
+            self.get_logger().error(f"Exception going to center: {e}\n{traceback.format_exc()}")
+            self.oob_active = True  # enable regardless, to be safe
+
     # --- OOB recovery check (called inside navigation loops) ---
     def maybe_recover_if_oob(self, last_check_time: List[float]) -> None:
         """
         If robot is outside the quad, send a corrective pose to push it back inside.
         last_check_time: a single-element list storing last check timestamp (mutable).
         """
-        if not self.oob_recovery_enabled:
+        if not (self.oob_active and self.oob_recovery_enabled):
             return
         now = self.get_clock().now().nanoseconds * 1e-9
         if last_check_time[0] is None or (now - last_check_time[0]) >= self.oob_check_period:
@@ -276,9 +323,8 @@ class RandomNavigator(Node):
                 fix.pose.position.z = 0.0
                 fix.pose.orientation.x, fix.pose.orientation.y, fix.pose.orientation.z, fix.pose.orientation.w = q
                 self.get_logger().warn(
-                    f"Out of bounds detected at ({cx:.2f},{cy:.2f}) — sending corrective pose to ({fix_x:.2f},{fix_y:.2f})."
+                    f"Out of bounds at ({cx:.2f},{cy:.2f}) — corrective pose to ({fix_x:.2f},{fix_y:.2f})."
                 )
-                # Send corrective goal and wait until complete before resuming
                 try:
                     self.navigator.goToPose(fix)
                     while not self.navigator.isTaskComplete():
@@ -313,10 +359,9 @@ class RandomNavigator(Node):
             )
             try:
                 self.navigator.goToPose(pose)
-                last_check_time = [None]
+                # NO OOB checks during calibration
                 while not self.navigator.isTaskComplete():
                     rclpy.spin_once(self, timeout_sec=1.0)
-                    self.maybe_recover_if_oob(last_check_time)
                 result = self.navigator.getResult()
                 if result == TaskResult.SUCCEEDED:
                     self.get_logger().info(f"Reached {goal} successfully.")
@@ -375,6 +420,7 @@ class RandomNavigator(Node):
                     last_check_time = [None]
                     while not self.navigator.isTaskComplete():
                         rclpy.spin_once(self, timeout_sec=1.0)
+                        # OOB checks are active now
                         self.maybe_recover_if_oob(last_check_time)
                     result = self.navigator.getResult()
                     if result == TaskResult.SUCCEEDED:
