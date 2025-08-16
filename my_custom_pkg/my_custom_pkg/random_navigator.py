@@ -124,7 +124,6 @@ def play_random_animation():
         'push-up.d6ac',
         'rollover.d6ac',
         'sit.d6ac',
-        'spacewalk.d6ac',
         'look_down.d6ac',
         'shake_head.d6ac',
         'stretch.d6ac',
@@ -200,7 +199,7 @@ class PalmDetector:
 
         return fingers_extended and thumb_farther and palm_toward
 
-    def wait_for_palm(self, timeout_sec: float = 20.0) -> bool:
+    def wait_for_palm(self, timeout_sec: float = 6.0) -> bool:
         # Prefer V4L2 on RPi
         cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
         if not cap.isOpened():
@@ -263,7 +262,7 @@ class RandomNavigator(Node):
 
         # CV parameters
         self.declare_parameter('camera_index', 0)
-        self.declare_parameter('palm_timeout_sec', 20.0)
+        self.declare_parameter('palm_timeout_sec', 6.0)
 
         # Read parameters
         self.corners = {
