@@ -109,6 +109,8 @@ def point_outside_convex_quad(x: float, y: float, verts_ccw: List[Tuple[float, f
             return True
     return False
 
+animation_choice = 0
+
 def play_random_animation():
     """
     Pick a random animation, play it, and if it requires a reset
@@ -116,6 +118,7 @@ def play_random_animation():
     """
 
     # === Fill in your filenames here ===
+    global animation_choice
     reset_action = 'stand.d6ac'  # the reset to standing
 
     animations = [
@@ -134,7 +137,9 @@ def play_random_animation():
         'sit.d6ac',
     }
 
-    choice = random.choice(animations)
+    #choice = random.choice(animations)
+    choice = animations[animation_choice % len(animations)]
+    animation_choice += 1
     print(f"Playing animation: {choice}")
 
     try:
