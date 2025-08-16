@@ -109,6 +109,48 @@ def point_outside_convex_quad(x: float, y: float, verts_ccw: List[Tuple[float, f
             return True
     return False
 
+def play_random_animation():
+    """
+    Pick a random animation, play it, and if it requires a reset
+    (e.g., robot not ending in stand), play the reset animation automatically.
+    """
+
+    # === Fill in your filenames here ===
+    reset_action = 'stand.d6ac'  # the reset to standing
+
+    animations = [
+        'lie_down.d6ac',
+        'pee.d6ac',
+        'push-up.d6ac',
+        'rollover.d6ac',
+        'sit.d6ac',
+        'spacewalk.d6ac',
+        'look_down.d6ac',
+        'shake_head.d6ac',
+        'stretch.d6ac',
+    ]
+
+    needs_reset = {
+        'lie_down.d6ac',
+        'sit.d6ac',
+    }
+
+    choice = random.choice(animations)
+    print(f"Playing animation: {choice}")
+
+    try:
+        runActionGroup(choice, True)  # wait until finished
+        if choice in needs_reset:
+            print(f"{choice} requires reset → playing {reset_action}")
+            time.sleep(10)
+            runActionGroup(reset_action, True)
+        else:
+            print(f"{choice} completed without reset.")
+    except Exception as e:
+        print(f"Error playing animation {choice}: {e}")
+
+    return choice
+
 # --- CV: palm (open hand) detector ---
 class PalmDetector:
     """
@@ -508,6 +550,7 @@ class RandomNavigator(Node):
                     if result == TaskResult.SUCCEEDED:
                         self.get_logger().info(f"Random goal {count+1} reached successfully.")
                         # === ONLY here: after a random-goal success ===
+                        play_random_animation()
                         self.maybe_run_sit_stand_on_palm()
                     else:
                         self.get_logger().warn(f"Random goal {count+1} failed. Result: {result}")
