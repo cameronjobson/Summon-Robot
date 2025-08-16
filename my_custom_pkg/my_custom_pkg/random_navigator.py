@@ -11,6 +11,8 @@ from typing import List, Tuple
 import os
 import time
 import subprocess
+sys.path.append('/home/ubuntu/software/puppypi_control')
+from action_group_control import runActionGroup
 
 # --- Optional CV imports (only needed for palm check) ---
 import cv2
@@ -183,6 +185,14 @@ class PalmDetector:
 class RandomNavigator(Node):
     def __init__(self):
         super().__init__('random_navigator')
+
+        try:
+            self.get_logger().info("Playing stretch.d6ac before starting navigation...")
+            runActionGroup('stretch.d6ac', True)  # True = wait until finished
+            self.get_logger().info("Stretch complete.")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to run stretch.d6ac: {e}")
+
         # Declare parameters with defaults
         self.declare_parameter('top_left', [0.0, 0.0])
         self.declare_parameter('top_right', [2.0, 0.0])
@@ -263,13 +273,6 @@ class RandomNavigator(Node):
         self.get_logger().info('Waiting for Nav2 to become active...')
         self.navigator.waitUntilNav2Active()
         self.get_logger().info('Nav2 is active.')
-
-        # Try to apply speed limits (if supported)
-        try:
-            self.navigator.setSpeedLimits(self.max_speed, self.max_accel, 0.0)
-            self.get_logger().info(f"Speed limits set: max_speed={self.max_speed}, max_accel={self.max_accel}")
-        except Exception as e:
-            self.get_logger().warn(f"setSpeedLimits not supported or failed: {e}")
 
         # Initial pose
         self.set_initial_pose()
